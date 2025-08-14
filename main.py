@@ -25,10 +25,10 @@ import numpy as np
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Configuración
-BOT_TOKEN = "8238854367:AAEt1pg-imixMUgpg2MM-AwtnQW-vbPD5zo"
-AWS_ACCESS_KEY = "AKPALKLOZH1755184662"
-AWS_SECRET_KEY = "pNUREtQZ1Q2uzPn50XgWS5v1OdA8ZFOf5mmxd+vp"
-ASSOCIATE_TAG = "vsoatg-21"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY") 
+ASSOCIATE_TAG = os.getenv("ASSOCIATE_TAG")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/amazon_bot")
 
 # Estados para FSM

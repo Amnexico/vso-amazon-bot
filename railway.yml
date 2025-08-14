@@ -1,0 +1,8 @@
+version: 2
+build:
+  command: pip install -r requirements.txt
+start:
+  command: python main.py
+environment:
+  - NODE_ENV=production
+  - PYTHONUNBUFFERED=1

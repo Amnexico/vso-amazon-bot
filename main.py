@@ -13,7 +13,8 @@ import xml.etree.ElementTree as ET
 import aiohttp
 import asyncpg
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command, Text
+from aiogram.filters import Command
+from aiogram import F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -720,11 +721,11 @@ class TelegramBot:
         self.dp.message(Command("stats"))(self.cmd_stats)
         
         # Callbacks
-        self.dp.callback_query(Text(text_startswith="history:"))(self.cb_show_history)
-        self.dp.callback_query(Text(text_startswith="unfollow:"))(self.cb_unfollow_product)
-        self.dp.callback_query(Text(text_startswith="follow_confirm:"))(self.cb_confirm_follow)
-        self.dp.callback_query(Text(text_startswith="buy:"))(self.cb_buy_product)
-        self.dp.callback_query(Text(text_startswith="menu:"))(self.cb_menu_navigation)
+        self.dp.callback_query(F.data.startswith("history:"))(self.cb_show_history)
+        self.dp.callback_query(F.data.startswith("unfollow:"))(self.cb_unfollow_product)
+        self.dp.callback_query(F.data.startswith("follow_confirm:"))(self.cb_confirm_follow)
+        self.dp.callback_query(F.data.startswith("buy:"))(self.cb_buy_product)
+        self.dp.callback_query(F.data.startswith("menu:"))(self.cb_menu_navigation)
         
         # Estados FSM
         self.dp.message(ProductStates.waiting_for_url)(self.handle_product_url)

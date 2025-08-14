@@ -9,7 +9,6 @@ import hmac
 import base64
 from urllib.parse import quote, urlencode
 import xml.etree.ElementTree as ET
-
 import aiohttp
 import asyncpg
 from aiogram import Bot, Dispatcher, types
@@ -25,12 +24,31 @@ import io
 import numpy as np
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# Configuración
+# Configuración con validación
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY") 
 ASSOCIATE_TAG = os.getenv("ASSOCIATE_TAG")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost/amazon_bot")
+PAAPI_HOST = os.getenv("PAAPI_HOST", "webservices.amazon.com")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Validación crítica de variables
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN no encontrado en variables de entorno")
+if not AWS_ACCESS_KEY:
+    raise ValueError("❌ AWS_ACCESS_KEY no encontrado en variables de entorno")
+if not AWS_SECRET_KEY:
+    raise ValueError("❌ AWS_SECRET_KEY no encontrado en variables de entorno")
+if not ASSOCIATE_TAG:
+    raise ValueError("❌ ASSOCIATE_TAG no encontrado en variables de entorno")
+
+print(f"✅ Variables cargadas correctamente:")
+print(f"   - BOT_TOKEN: {'✓' if BOT_TOKEN else '✗'}")
+print(f"   - AWS_ACCESS_KEY: {'✓' if AWS_ACCESS_KEY else '✗'}")
+print(f"   - AWS_SECRET_KEY: {'✓' if AWS_SECRET_KEY else '✗'}")
+print(f"   - ASSOCIATE_TAG: {'✓' if ASSOCIATE_TAG else '✗'}")
+print(f"   - PAAPI_HOST: {PAAPI_HOST}")
+print(f"   - DATABASE_URL: {'✓' if DATABASE_URL else '✗'}")
 
 # Estados para FSM
 class ProductStates(StatesGroup):

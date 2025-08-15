@@ -1,4 +1,537 @@
-import os
+# HANDLERS DE MENSAJES
+    
+    async def handle_product_url(self, message: types.Message, state: FSMContext):
+        """Maneja URL de producto en estado de espera"""
+        if not message.text or not self.is_amazon_url(message.text):
+            await message.answer(
+                "❌ <b>URL no válida</b>\n\n"
+                "Por favor, envía un enlace válido de Amazon.es\n"
+                "Ejemplo: https://amazon.es/dp/B08N5WRWNW\n\n"
+                "<i>Cancelar: /cancel</i>",
+                parse_mode="HTML"
+            )
+            return
+        
+        # Guardar URL en estado y pedir precio objetivo
+        await state.update_data(product_url=message.text)
+        await state.set_state(ProductStates.waiting_for_target_price)
+        
+        await message.answer(
+            "💰 <b>¿Cuál es tu precio objetivo para este producto?</b>\n\n"
+            "Envíame el precio máximo que estarías dispuesto a pagar.\n"
+            "Te notificaré cuando el producto llegue a ese precio o menos.\n\n"
+            "Ejemplos: <code>50</code>, <code>99.99</code>, <code>25,50€</code>\n\n"
+            "<i>Cancelar: /cancel</i>",
+            parse_mode="HTML"
+        )
+    
+    async def handle_amazon_url(self, message: types.Message):
+        """Maneja URLs de Amazon enviadas directamente"""
+        await self.process_amazon_url(message, message.text)
+    
+    async def process_amazon_url(self, message: types.Message, url: str):
+        """Procesa URL de Amazon y muestra información del producto"""
+        asin = self.extract_asin_from_url(url)
+        
+        if not asin:
+            await message.answer(
+                "❌ No pude extraer el código del producto de esa URL.\n"
+                "Asegúrate de que sea un enlace válido de Amazon.es"
+            )
+            return
+        
+        # Mostrar mensaje de carga
+        loading_msg = await message.answer("🔍 <b>Buscando producto...</b>", parse_mode="HTML")
+        
+        try:
+            # Obtener información del producto
+            product_data = await self.amazon.get_product_info(asin)
+            
+            if not product_data:
+                await loading_msg.edit_text(
+                    "❌ <b>No pude obtener información del producto</b>\n\n"
+                    "Posibles causas:\n"
+                    "• El producto no está disponible\n"
+                    "• URL incorrecta\n"
+                    "• Error temporal de Amazon\n\n"
+                    "Intenta de nuevo en unos minutos.",
+                    parse_mode="HTML"
+                )
+                return
+            
+            # Guardar/actualizar producto en DB
+            product_id = await self.db.add_or_update_product(product_data)
+            
+            # Obtener historial de precios si existe
+            price_history = await self.db.get_price_history(product_id, 30)
+            min_price = await self.db.get_min_price(product_id)
+            
+            # Verificar si ya lo sigue el usuario
+            user_products = await self.db.get_user_products(message.from_user.id)
+            already_following = any(p['id'] == product_id for p in user_products)
+            
+            # Crear mensaje del producto
+            await self.send_product_info(
+                message.chat.id,
+                product_data,
+                product_id,
+                price_history,
+                min_price,
+                already_following,
+                loading_msg.message_id
+            )
+            
+        except Exception as e:
+            logger.error(f"Error procesando URL {url}: {e}")
+            await loading_msg.edit_text(
+                "❌ <b>Error procesando el producto</b>\n\n"
+                "Inténtalo de nuevo en unos minutos.",
+                parse_mode="HTML"
+            )
+    
+    async def send_product_info(self, chat_id: int, product: Dict, product_id: int,
+                               price_history: List, min_price: float, already_following: bool,
+                               edit_message_id: int = None):
+        """Envía información completa del producto"""
+        
+        # Preparar mensaje
+        title = product['title']
+        price = product['price']
+        
+        message_text = f"📱 <b>{title}</b>\n\n"
+        
+        if price:
+            message_text += f"💰 <b>Precio actual: {price:.2f}€</b>\n"
+            
+            # Indicador de precio mínimo
+            if min_price and abs(price - min_price) < 0.01:
+                message_text += "🏆 <b>¡PRECIO MÍNIMO HISTÓRICO!</b>\n"
+            elif min_price:
+                diff = price - min_price
+                message_text += f"📊 Mínimo histórico: {min_price:.2f}€ (+{diff:.2f}€)\n"
+        else:
+            message_text += "❌ <b>Precio no disponible</b>\n"
+        
+        # Información adicional
+        if product['availability']:
+            if 'Available' in product['availability'] or 'InStock' in product['availability']:
+                message_text += "✅ Disponible\n"
+            else:
+                message_text += f"⚠️ {product['availability']}\n"
+        
+        if product['rating'] and product['reviews_count']:
+            stars = "⭐" * int(product['rating'])
+            message_text += f"{stars} {product['rating']:.1f}/5 ({product['reviews_count']:,} reseñas)\n"
+        
+        # Historial de precios
+        if price_history:
+            message_text += f"\n📈 <b>Historial ({len(price_history)} registros):</b>\n"
+            
+            if len(price_history) >= 2:
+                trend = "📈" if price_history[-1]['price'] > price_history[-2]['price'] else "📉"
+                message_text += f"{trend} Tendencia reciente\n"
+        else:
+            message_text += "\n📊 <i>Primer registro de precio</i>\n"
+        
+        # Crear botones
+        keyboard = InlineKeyboardBuilder()
+        
+        # Botón principal
+        if min_price and price and abs(price - min_price) < 0.01:
+            keyboard.row(InlineKeyboardButton(
+                text="🏆 COMPRAR AL MÍNIMO HISTÓRICO",
+                url=product['affiliate_url']
+            ))
+        else:
+            keyboard.row(InlineKeyboardButton(
+                text="🛒 COMPRAR AHORA",
+                url=product['affiliate_url']
+            ))
+        
+        # Botones secundarios
+        if already_following:
+            keyboard.row(InlineKeyboardButton(
+                text="✅ Ya lo sigues",
+                callback_data="noop"
+            ))
+        else:
+            keyboard.row(InlineKeyboardButton(
+                text="🔔 SEGUIR PRODUCTO",
+                callback_data=f"follow_confirm:{product_id}"
+            ))
+        
+        keyboard.row(
+            InlineKeyboardButton(
+                text="📊 Ver Gráfico",
+                callback_data=f"history:{product_id}"
+            ),
+            InlineKeyboardButton(
+                text="🔍 Buscar Similar",
+                callback_data=f"similar:{product_id}"
+            )
+        )
+        
+        # Enviar o editar mensaje
+        try:
+            if edit_message_id:
+                await self.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=edit_message_id,
+                    text=message_text,
+                    reply_markup=keyboard.as_markup(),
+                    parse_mode="HTML"
+                )
+                
+                # Enviar imagen por separado si está disponible
+                if product['image_url']:
+                    await self.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=product['image_url'],
+                        reply_markup=keyboard.as_markup()
+                    )
+            else:
+                if product['image_url']:
+                    await self.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=product['image_url'],
+                        caption=message_text,
+                        reply_markup=keyboard.as_markup(),
+                        parse_mode="HTML"
+                    )
+                else:
+                    await self.bot.send_message(
+                        chat_id=chat_id,
+                        text=message_text,
+                        reply_markup=keyboard.as_markup(),
+                        parse_mode="HTML"
+                    )
+            
+            # Registrar analytics
+            await self.db.log_analytics(
+                chat_id, product_id, "view_product", 
+                {'source': 'url_share', 'has_image': bool(product['image_url'])}
+            )
+            
+        except Exception as e:
+            logger.error(f"Error enviando info de producto: {e}")
+    
+    # CALLBACK HANDLERS
+    
+    async def cb_confirm_follow(self, callback: CallbackQuery):
+        """Confirma seguimiento de producto"""
+        try:
+            product_id = int(callback.data.split(":")[1])
+            user_id = callback.from_user.id
+            
+            # Verificar que el producto existe
+            async with self.db.pool.acquire() as conn:
+                product = await conn.fetchrow(
+                    "SELECT * FROM products WHERE id = $1", product_id
+                )
+            
+            if not product:
+                await callback.answer("❌ Producto no encontrado")
+                return
+            
+            # Añadir seguimiento
+            success = await self.db.add_user_product(user_id, product_id)
+            
+            if success:
+                await callback.answer("✅ ¡Producto añadido a tu lista!")
+                
+                # Actualizar botón
+                keyboard = InlineKeyboardBuilder()
+                keyboard.row(InlineKeyboardButton(
+                    text="🛒 COMPRAR AHORA",
+                    url=product['affiliate_url']
+                ))
+                keyboard.row(InlineKeyboardButton(
+                    text="✅ Siguiendo producto",
+                    callback_data="noop"
+                ))
+                keyboard.row(
+                    InlineKeyboardButton(
+                        text="📊 Ver Gráfico",
+                        callback_data=f"history:{product_id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="🗑️ Dejar de Seguir",
+                        callback_data=f"unfollow:{product_id}"
+                    )
+                )
+                
+                try:
+                    await callback.message.edit_reply_markup(
+                        reply_markup=keyboard.as_markup()
+                    )
+                except:
+                    pass  # Ignorar si no se puede editar
+                
+                # Registrar analytics
+                await self.db.log_analytics(user_id, product_id, "follow_product")
+                
+            else:
+                await callback.answer("❌ Error al seguir el producto")
+                
+        except Exception as e:
+            logger.error(f"Error en follow confirm: {e}")
+            await callback.answer("❌ Error interno")
+    
+    async def cb_unfollow_product(self, callback: CallbackQuery):
+        """Deja de seguir producto"""
+        try:
+            product_id = int(callback.data.split(":")[1])
+            user_id = callback.from_user.id
+            
+            success = await self.db.remove_user_product(user_id, product_id)
+            
+            if success:
+                await callback.answer("✅ Producto eliminado de tu lista")
+                
+                # Registrar analytics
+                await self.db.log_analytics(user_id, product_id, "unfollow_product")
+                
+                # Actualizar mensaje si es posible
+                try:
+                    await callback.message.delete()
+                except:
+                    pass
+            else:
+                await callback.answer("❌ Error al eliminar producto")
+                
+        except Exception as e:
+            logger.error(f"Error en unfollow: {e}")
+            await callback.answer("❌ Error interno")
+    
+    async def cb_show_history(self, callback: CallbackQuery):
+        """Muestra historial de precios con gráfico"""
+        try:
+            product_id = int(callback.data.split(":")[1])
+            
+            # Obtener historial de precios
+            price_history = await self.db.get_price_history(product_id, 30)
+            
+            if not price_history or len(price_history) < 2:
+                await callback.answer("📊 Historial insuficiente para generar gráfico")
+                return
+            
+            # Generar gráfico
+            chart_buffer = await self.generate_price_chart(product_id, price_history)
+            
+            if chart_buffer:
+                # Obtener info del producto
+                async with self.db.pool.acquire() as conn:
+                    product = await conn.fetchrow(
+                        "SELECT title, current_price FROM products WHERE id = $1", 
+                        product_id
+                    )
+                
+                min_price = min(p['price'] for p in price_history)
+                max_price = max(p['price'] for p in price_history)
+                avg_price = sum(p['price'] for p in price_history) / len(price_history)
+                
+                caption = f"""
+📊 <b>Historial de {product['title'][:40]}...</b>
+
+📈 <b>Estadísticas (30 días):</b>
+💰 Precio actual: {product['current_price']:.2f}€
+🔻 Mínimo: {min_price:.2f}€
+🔺 Máximo: {max_price:.2f}€
+📊 Promedio: {avg_price:.2f}€
+
+📅 <b>Registros:</b> {len(price_history)} puntos de datos
+                """
+                
+                await callback.message.answer_photo(
+                    photo=chart_buffer,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+                
+                await callback.answer()
+                
+                # Registrar analytics
+                await self.db.log_analytics(
+                    callback.from_user.id, product_id, "view_chart"
+                )
+            else:
+                await callback.answer("❌ Error generando gráfico")
+                
+        except Exception as e:
+            logger.error(f"Error mostrando historial: {e}")
+            await callback.answer("❌ Error interno")
+    
+    async def generate_price_chart(self, product_id: int, price_history: List[Dict]) -> Optional[io.BytesIO]:
+        """Genera gráfico de evolución de precios"""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Backend para servidores sin GUI
+            
+            dates = [p['recorded_at'] for p in price_history]
+            prices = [float(p['price']) for p in price_history]
+            
+            # Configurar matplotlib
+            plt.style.use('default')
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            # Gráfico principal
+            ax.plot(dates, prices, linewidth=2.5, color='#FF9500', marker='o', markersize=4)
+            ax.fill_between(dates, prices, alpha=0.3, color='#FF9500')
+            
+            # Líneas de referencia
+            min_price = min(prices)
+            max_price = max(prices)
+            avg_price = sum(prices) / len(prices)
+            
+            ax.axhline(y=min_price, color='green', linestyle='--', alpha=0.7, label=f'Mínimo: {min_price:.2f}€')
+            ax.axhline(y=avg_price, color='blue', linestyle='--', alpha=0.7, label=f'Promedio: {avg_price:.2f}€')
+            
+            # Styling
+            ax.set_title('Evolución del Precio - Últimos 30 días', fontsize=16, fontweight='bold')
+            ax.set_xlabel('Fecha', fontsize=12)
+            ax.set_ylabel('Precio (€)', fontsize=12)
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc='upper right')
+            
+            # Formatear fechas en eje X
+            fig.autofmt_xdate()
+            
+            # Ajustar layout
+            plt.tight_layout()
+            
+            # Guardar en buffer
+            buffer = io.BytesIO()
+            plt.savefig(buffer, format='PNG', dpi=150, bbox_inches='tight')
+            buffer.seek(0)
+            plt.close(fig)
+            
+            return buffer
+            
+        except Exception as e:
+            logger.error(f"Error generando gráfico: {e}")
+            return None
+    
+    async def cb_buy_product(self, callback: CallbackQuery):
+        """Registra click en enlace de compra"""
+        try:
+            product_id = int(callback.data.split(":")[1])
+            user_id = callback.from_user.id
+            
+            # Registrar click
+            await self.db.log_analytics(user_id, product_id, "click_buy")
+            
+            await callback.answer("🛒 Redirigiendo a Amazon...")
+            
+        except Exception as e:
+            logger.error(f"Error en buy click: {e}")
+            await callback.answer()
+    
+    async def cb_menu_navigation(self, callback: CallbackQuery):
+        """Maneja navegación del menú"""
+        try:
+            action = callback.data.split(":")[1]
+            
+            if action == "search":
+                await callback.message.edit_text(
+                    "🔍 <b>Buscar Producto</b>\n\n"
+                    "Envíame un enlace de Amazon.es para empezar a seguir el precio.\n\n"
+                    "También puedes usar:\n"
+                    "• /seguir - Para buscar paso a paso\n"
+                    "• Pegar enlace directamente en el chat",
+                    parse_mode="HTML",
+                    reply_markup=await self.create_main_menu()
+                )
+            
+            elif action == "my_products":
+                # Redirigir al comando lista
+                await self.cmd_my_products(callback.message)
+            
+            elif action == "stats":
+                await self.cmd_stats(callback.message)
+            
+            elif action == "settings":
+                await self.cmd_settings(callback.message)
+            
+            elif action == "help":
+                await self.cmd_help(callback.message)
+            
+            await callback.answer()
+            
+        except Exception as e:
+            logger.error(f"Error en navegación de menú: {e}")
+            await callback.answer("❌ Error interno")
+    
+    async def start_bot(self):
+        """Inicia el bot y todos los servicios"""
+        try:
+            # Inicializar base de datos
+            await self.db.init_db()
+            logger.info("Base de datos inicializada")
+            
+            # Inicializar monitor de precios
+            self.monitor = PriceMonitor(self.db, self.amazon, self.bot)
+            self.monitor.start_monitoring()
+            logger.info("Monitor de precios iniciado")
+            
+            # Configurar webhook o polling
+            await self.dp.start_polling(self.bot, drop_pending_updates=True)
+            
+        except Exception as e:
+            logger.error(f"Error iniciando bot: {e}")
+            raise
+    
+    async def stop_bot(self):
+        """Para el bot y limpia recursos"""
+        try:
+            if self.monitor and self.monitor.scheduler.running:
+                self.monitor.scheduler.shutdown()
+            
+            if self.db.pool:
+                await self.db.pool.close()
+            
+            await self.bot.session.close()
+            logger.info("Bot detenido correctamente")
+            
+        except Exception as e:
+            logger.error(f"Error deteniendo bot: {e}")
+
+# Funciones auxiliares para despliegue en Railway
+
+async def create_app():
+    """Crea la aplicación del bot"""
+    bot_instance = TelegramBot()
+    return bot_instance
+
+def setup_logging():
+    """Configura el sistema de logging"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('bot.log') if os.path.exists('/app') else logging.StreamHandler()
+        ]
+    )
+
+# Script principal
+async def main():
+    """Función principal del bot"""
+    setup_logging()
+    
+    bot = await create_app()
+    
+    try:
+        logger.info("🚀 Iniciando VSO Amazon Bot...")
+        await bot.start_bot()
+    except KeyboardInterrupt:
+        logger.info("⏹️ Bot detenido por usuario")
+    except Exception as e:
+        logger.error(f"💥 Error crítico: {e}")
+    finally:
+        await bot.stop_bot()
+
+if __name__ == "__main__":
+    asyncio.run(main())import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -51,7 +584,474 @@ print(f"   - PAAPI_HOST: {PAAPI_HOST}")
 print(f"   - DATABASE_URL: {'✓' if DATABASE_URL else '✗'}")
 
 # Estados para FSM
-class ProductStates(StatesGroup):
+class TelegramBot:
+    """Bot principal de Telegram"""
+    
+    def __init__(self):
+        self.bot = Bot(token=BOT_TOKEN)
+        self.dp = Dispatcher(storage=MemoryStorage())
+        self.db = DatabaseManager(DATABASE_URL)
+        self.amazon = AmazonAPI()
+        self.monitor = None
+        
+        # Registrar handlers
+        self.setup_handlers()
+    
+    def setup_handlers(self):
+        """Configura los handlers del bot"""
+        
+        # Comandos básicos
+        self.dp.message(Command("start"))(self.cmd_start)
+        self.dp.message(Command("help"))(self.cmd_help)
+        self.dp.message(Command("seguir"))(self.cmd_follow_product)
+        self.dp.message(Command("lista"))(self.cmd_my_products)
+        self.dp.message(Command("config"))(self.cmd_settings)
+        self.dp.message(Command("stats"))(self.cmd_stats)
+        
+        # Callbacks
+        self.dp.callback_query(F.data.startswith("history:"))(self.cb_show_history)
+        self.dp.callback_query(F.data.startswith("unfollow:"))(self.cb_unfollow_product)
+        self.dp.callback_query(F.data.startswith("follow_confirm:"))(self.cb_confirm_follow)
+        self.dp.callback_query(F.data.startswith("buy:"))(self.cb_buy_product)
+        self.dp.callback_query(F.data.startswith("menu:"))(self.cb_menu_navigation)
+        
+        # Estados FSM
+        self.dp.message(ProductStates.waiting_for_url)(self.handle_product_url)
+        self.dp.message(ProductStates.waiting_for_target_price)(self.handle_target_price)
+        
+        # Mensajes con URLs de Amazon
+        self.dp.message(lambda msg: self.is_amazon_url(msg.text) if msg.text else False)(self.handle_amazon_url)
+    
+    def extract_asin_from_url(self, url: str) -> Optional[str]:
+        """Extrae ASIN de URL de Amazon"""
+        patterns = [
+            r'/dp/([A-Z0-9]{10})',
+            r'/gp/product/([A-Z0-9]{10})',
+            r'amazon\.es/.*?/([A-Z0-9]{10})',
+            r'/product/([A-Z0-9]{10})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        return None
+    
+    def is_amazon_url(self, text: str) -> bool:
+        """Verifica si el texto contiene URL de Amazon España"""
+        if not text:
+            return False
+        return 'amazon.es' in text.lower() and self.extract_asin_from_url(text) is not None
+
+    async def handle_target_price(self, message: types.Message, state: FSMContext):
+        """Maneja el precio objetivo ingresado por el usuario"""
+        try:
+            # Obtener datos del estado
+            data = await state.get_data()
+            product_url = data.get('product_url')
+            
+            if not product_url:
+                await message.answer("❌ Error: URL del producto no encontrada. Inicia de nuevo con /seguir")
+                await state.clear()
+                return
+            
+            # Validar y convertir precio
+            try:
+                target_price = float(message.text.replace('€', '').replace(',', '.').strip())
+                if target_price <= 0:
+                    raise ValueError("El precio debe ser mayor a 0")
+            except ValueError:
+                await message.answer(
+                    "❌ **Precio inválido**\n\n"
+                    "Por favor ingresa un número válido (ejemplo: 99.99 o 99,99€)"
+                )
+                return
+            
+            # Extraer ASIN del URL
+            asin = self.extract_asin_from_url(product_url)
+            if not asin:
+                await message.answer("❌ No se pudo extraer el ASIN del producto. Verifica la URL.")
+                await state.clear()
+                return
+            
+            # Obtener información del producto
+            await message.answer("🔍 **Obteniendo información del producto...**", parse_mode="Markdown")
+            
+            try:
+                product_info = await self.amazon.get_product_info(asin)
+                if not product_info:
+                    await message.answer("❌ No se pudo obtener información del producto")
+                    await state.clear()
+                    return
+                
+                # Guardar producto en base de datos
+                product_id = await self.db.add_or_update_product(product_info)
+                
+                # Añadir seguimiento del usuario
+                user_id = message.from_user.id
+                await self.db.add_user_product(user_id, product_id, target_price)
+                
+                current_price = product_info.get('price', 0)
+                title = product_info.get('title', 'Producto desconocido')
+                
+                # Crear respuesta
+                status = "🔥 **¡PRECIO OBJETIVO ALCANZADO!**" if current_price and current_price <= target_price else "📊 **Seguimiento Activo**"
+                
+                if current_price:
+                    price_diff = current_price - target_price
+                    diff_text = f"(-{abs(price_diff):.2f}€)" if price_diff < 0 else f"(+{price_diff:.2f}€)"
+                    
+                    response = f"""
+{status}
+
+🏷️ **Producto:** {title[:80]}{'...' if len(title) > 80 else ''}
+
+💰 **Precios:**
+• Actual: {current_price:.2f}€
+• Objetivo: {target_price:.2f}€
+• Diferencia: {diff_text}
+
+🔔 **Estado:** {'¡Compra ahora!' if current_price <= target_price else 'Te notificaré cuando baje'}
+"""
+                else:
+                    response = f"""
+{status}
+
+🏷️ **Producto:** {title[:80]}{'...' if len(title) > 80 else ''}
+
+💰 **Precio objetivo:** {target_price:.2f}€
+⚠️ **Precio actual:** No disponible
+
+🔔 **Estado:** Te notificaré cuando esté disponible y al precio objetivo
+"""
+                
+                # Crear teclado
+                keyboard = InlineKeyboardBuilder()
+                keyboard.add(InlineKeyboardButton(
+                    text="📈 Ver Histórico",
+                    callback_data=f"history:{product_id}"
+                ))
+                keyboard.add(InlineKeyboardButton(
+                    text="🛒 Ver Producto",
+                    url=product_info.get('affiliate_url', product_url)
+                ))
+                keyboard.add(InlineKeyboardButton(
+                    text="❌ Eliminar Seguimiento",
+                    callback_data=f"unfollow:{product_id}"
+                ))
+                keyboard.adjust(1)
+                
+                await message.answer(
+                    response,
+                    reply_markup=keyboard.as_markup(),
+                    parse_mode="Markdown"
+                )
+                
+                # Log del seguimiento
+                logger.info(f"Nuevo seguimiento creado: User {user_id}, ASIN {asin}, Target {target_price}€")
+                
+            except Exception as e:
+                logger.error(f"Error obteniendo producto: {e}")
+                await message.answer(
+                    "❌ **Error al procesar el producto**\n\n"
+                    "Puede ser que:\n"
+                    "• La URL no sea válida\n"
+                    "• El producto no esté disponible\n"
+                    "• Problemas con Amazon API\n\n"
+                    "Inténtalo de nuevo con /seguir",
+                    parse_mode="Markdown"
+                )
+            
+            # Limpiar estado
+            await state.clear()
+            
+        except Exception as e:
+            logger.error(f"Error en handle_target_price: {e}")
+            await message.answer("❌ Error interno. Inténtalo de nuevo con /seguir")
+            await state.clear()
+    
+    async def create_main_menu(self) -> InlineKeyboardMarkup:
+        """Crea menú principal"""
+        keyboard = InlineKeyboardBuilder()
+        
+        keyboard.row(InlineKeyboardButton(
+            text="🔍 Buscar Producto",
+            callback_data="menu:search"
+        ))
+        
+        keyboard.row(InlineKeyboardButton(
+            text="📋 Mis Productos",
+            callback_data="menu:my_products"
+        ))
+        
+        keyboard.row(
+            InlineKeyboardButton(
+                text="📊 Estadísticas",
+                callback_data="menu:stats"
+            ),
+            InlineKeyboardButton(
+                text="⚙️ Configuración",
+                callback_data="menu:settings"
+            )
+        )
+        
+        keyboard.row(InlineKeyboardButton(
+            text="ℹ️ Ayuda",
+            callback_data="menu:help"
+        ))
+        
+        return keyboard.as_markup()
+    
+    # COMANDOS PRINCIPALES
+    
+    async def cmd_start(self, message: types.Message):
+        """Comando /start"""
+        user = message.from_user
+        
+        # Registrar usuario en DB
+        await self.db.add_user(user.id, user.username, user.first_name)
+        
+        welcome_message = f"""
+🎉 <b>¡Hola {user.first_name}!</b>
+
+🤖 Soy tu asistente personal para seguir precios en Amazon.es
+
+<b>¿Qué puedo hacer?</b>
+🔍 Seguir productos de Amazon automáticamente
+📉 Alertarte cuando bajan los precios
+🏆 Detectar precios mínimos históricos
+📊 Mostrarte gráficos de evolución
+💰 Ayudarte a ahorrar dinero
+
+<b>Para empezar:</b>
+• Envíame cualquier enlace de Amazon.es
+• Usa el menú de abajo para navegar
+• Escribe /help para ver todos los comandos
+
+¡Comencemos a ahorrar! 💪
+        """
+        
+        await message.answer(
+            welcome_message,
+            reply_markup=await self.create_main_menu(),
+            parse_mode="HTML"
+        )
+    
+    async def cmd_help(self, message: types.Message):
+        """Comando /help"""
+        help_text = """
+<b>🤖 COMANDOS DISPONIBLES</b>
+
+<b>📋 Gestión de Productos:</b>
+/seguir - Seguir un nuevo producto
+/lista - Ver productos que sigues
+/buscar - Buscar productos en Amazon
+
+<b>⚙️ Configuración:</b>
+/config - Configurar notificaciones
+/horario - Cambiar horario de alertas
+
+<b>📊 Información:</b>
+/stats - Ver tus estadísticas
+/historial - Ver historial de un producto
+
+<b>🚀 Uso Rápido:</b>
+• Simplemente envía un enlace de Amazon.es
+• Te mostraré el precio actual e historial
+• Podrás seguir el producto con un botón
+
+<b>🔔 Tipos de Alertas:</b>
+🏆 Precio mínimo histórico
+📉 Bajadas de precio significativas
+🎯 Precio objetivo alcanzado
+📦 Cambios de disponibilidad
+
+<b>💡 Consejos:</b>
+• Sigue productos caros para mejores descuentos
+• Configura precios objetivo realistas
+• Activa notificaciones para no perder ofertas
+
+¿Necesitas ayuda específica? Escríbeme y te ayudo 😊
+        """
+        
+        await message.answer(help_text, parse_mode="HTML")
+    
+    async def cmd_follow_product(self, message: types.Message, state: FSMContext):
+        """Comando /seguir - Inicia proceso de seguimiento"""
+        await state.set_state(ProductStates.waiting_for_url)
+        
+        await message.answer(
+            "🔗 <b>Envíame el enlace del producto de Amazon.es que quieres seguir:</b>\n\n"
+            "Puedes copiar el enlace desde:\n"
+            "• La app de Amazon\n"
+            "• El navegador web\n"
+            "• Un mensaje compartido\n\n"
+            "<i>Cancelar: /cancel</i>",
+            parse_mode="HTML"
+        )
+    
+    async def cmd_my_products(self, message: types.Message):
+        """Comando /lista - Muestra productos seguidos"""
+        user_id = message.from_user.id
+        products = await self.db.get_user_products(user_id)
+        
+        if not products:
+            keyboard = InlineKeyboardBuilder()
+            keyboard.row(InlineKeyboardButton(
+                text="🔍 Buscar Producto",
+                callback_data="menu:search"
+            ))
+            
+            await message.answer(
+                "📭 <b>No estás siguiendo ningún producto aún</b>\n\n"
+                "Para empezar:\n"
+                "• Envíame un enlace de Amazon.es\n"
+                "• Usa /seguir para añadir productos\n"
+                "• Presiona el botón de abajo para buscar",
+                reply_markup=keyboard.as_markup(),
+                parse_mode="HTML"
+            )
+            return
+        
+        message_text = f"📋 <b>Tus productos seguidos ({len(products)}):</b>\n\n"
+        
+        for i, product in enumerate(products[:10], 1):  # Mostrar máximo 10
+            price = product['current_price']
+            title = product['title'][:40] + "..." if len(product['title']) > 40 else product['title']
+            
+            # Obtener precio mínimo
+            min_price = await self.db.get_min_price(product['id'])
+            price_indicator = ""
+            
+            if min_price and price and abs(price - min_price) < 0.01:
+                price_indicator = " 🏆"
+            elif product['target_price'] and price and price <= product['target_price']:
+                price_indicator = " 🎯"
+            
+            message_text += f"{i}. <b>{title}</b>\n"
+            if price:
+                message_text += f"   💰 {price:.2f}€{price_indicator}\n"
+            else:
+                message_text += f"   💰 No disponible{price_indicator}\n"
+            if product['target_price']:
+                message_text += f"   🎯 Objetivo: {product['target_price']:.2f}€\n"
+            message_text += "\n"
+        
+        if len(products) > 10:
+            message_text += f"... y {len(products) - 10} productos más\n\n"
+        
+        # Crear botones para navegación
+        keyboard = InlineKeyboardBuilder()
+        
+        keyboard.row(
+            InlineKeyboardButton(
+                text="📊 Ver Detalles",
+                callback_data="menu:product_details"
+            ),
+            InlineKeyboardButton(
+                text="🔍 Añadir Producto",
+                callback_data="menu:search"
+            )
+        )
+        
+        await message.answer(
+            message_text,
+            reply_markup=keyboard.as_markup(),
+            parse_mode="HTML"
+        )
+    
+    async def cmd_settings(self, message: types.Message):
+        """Comando /config - Configuración de usuario"""
+        keyboard = InlineKeyboardBuilder()
+        
+        keyboard.row(InlineKeyboardButton(
+            text="🔔 Notificaciones",
+            callback_data="settings:notifications"
+        ))
+        
+        keyboard.row(InlineKeyboardButton(
+            text="⏰ Horario de Alertas",
+            callback_data="settings:schedule"
+        ))
+        
+        keyboard.row(InlineKeyboardButton(
+            text="💰 Precio Mínimo",
+            callback_data="settings:min_price"
+        ))
+        
+        await message.answer(
+            "⚙️ <b>Configuración</b>\n\n"
+            "Personaliza cómo quieres recibir las alertas:",
+            reply_markup=keyboard.as_markup(),
+            parse_mode="HTML"
+        )
+    
+    async def cmd_stats(self, message: types.Message):
+        """Comando /stats - Estadísticas del usuario"""
+        user_id = message.from_user.id
+        
+        # Obtener estadísticas básicas
+        products = await self.db.get_user_products(user_id)
+        
+        async with self.db.pool.acquire() as conn:
+            # Clics totales
+            total_clicks = await conn.fetchval(
+                "SELECT COUNT(*) FROM analytics WHERE user_id = $1 AND action_type LIKE 'click%'",
+                user_id
+            ) or 0
+            
+            # Alertas recibidas
+            total_alerts = await conn.fetchval(
+                "SELECT COUNT(*) FROM analytics WHERE user_id = $1 AND action_type LIKE 'alert%'",
+                user_id
+            ) or 0
+            
+            # Registro del usuario
+            user_info = await conn.fetchrow(
+                "SELECT created_at, last_active FROM users WHERE user_id = $1",
+                user_id
+            )
+        
+        # Calcular ahorro estimado
+        total_savings = 0
+        for product in products:
+            min_price = await self.db.get_min_price(product['id'])
+            if min_price and product['current_price']:
+                # Estimar ahorro si compró al mínimo vs precio promedio
+                price_history = await self.db.get_price_history(product['id'], 30)
+                if price_history:
+                    avg_price = sum(p['price'] for p in price_history) / len(price_history)
+                    potential_saving = avg_price - min_price
+                    if potential_saving > 0:
+                        total_savings += potential_saving
+        
+        days_using = (datetime.now() - user_info['created_at']).days if user_info else 0
+        
+        stats_message = f"""
+📊 <b>TUS ESTADÍSTICAS</b>
+
+📱 <b>Productos seguidos:</b> {len(products)}
+🔔 <b>Alertas recibidas:</b> {total_alerts}
+👆 <b>Enlaces visitados:</b> {total_clicks}
+💰 <b>Ahorro estimado:</b> {total_savings:.2f}€
+
+📅 <b>Miembro desde:</b> {user_info['created_at'].strftime('%d/%m/%Y') if user_info else 'Hoy'}
+⏱️ <b>Días usando el bot:</b> {days_using}
+
+<b>🏆 PRODUCTOS CON MEJOR RENDIMIENTO:</b>
+        """
+        
+        # Añadir top productos por alertas
+        for product in products[:3]:
+            min_price = await self.db.get_min_price(product['id'])
+            current = product['current_price']
+            if min_price and current:
+                savings = current - min_price
+                if savings > 0:
+                    title = product['title'][:30] + "..."
+                    stats_message += f"\n💎 {title}\n   Ahorro máximo: {savings:.2f}€"
+        
+        await message.answer(stats_message, parse_mode="HTML") ProductStates(StatesGroup):
     waiting_for_url = State()
     waiting_for_target_price = State()
 
@@ -714,987 +1714,4 @@ class PriceMonitor:
         except Exception as e:
             logger.error(f"Error en limpieza de datos: {e}")
 
-class TelegramBot:
-    """Bot principal de Telegram"""
-    
-    def __init__(self):
-        self.bot = Bot(token=BOT_TOKEN)
-        self.dp = Dispatcher(storage=MemoryStorage())
-        self.db = DatabaseManager(DATABASE_URL)
-        self.amazon = AmazonAPI()
-        self.monitor = None
-        
-        # Registrar handlers
-        self.setup_handlers()
-    
-    def setup_handlers(self):
-        """Configura los handlers del bot"""
-        
-        # Comandos básicos
-        self.dp.message(Command("start"))(self.cmd_start)
-        self.dp.message(Command("help"))(self.cmd_help)
-        self.dp.message(Command("seguir"))(self.cmd_follow_product)
-        self.dp.message(Command("lista"))(self.cmd_my_products)
-        self.dp.message(Command("config"))(self.cmd_settings)
-        self.dp.message(Command("stats"))(self.cmd_stats)
-        
-        # Callbacks
-        self.dp.callback_query(F.data.startswith("history:"))(self.cb_show_history)
-        self.dp.callback_query(F.data.startswith("unfollow:"))(self.cb_unfollow_product)
-        self.dp.callback_query(F.data.startswith("follow_confirm:"))(self.cb_confirm_follow)
-        self.dp.callback_query(F.data.startswith("buy:"))(self.cb_buy_product)
-        self.dp.callback_query(F.data.startswith("menu:"))(self.cb_menu_navigation)
-        
-        # Estados FSM
-        self.dp.message(ProductStates.waiting_for_url)(self.handle_product_url)
-        self.dp.message(ProductStates.waiting_for_target_price)(self.handle_target_price)
-        
-        # Mensajes con URLs de Amazon
-        self.dp.message(lambda msg: self.is_amazon_url(msg.text) if msg.text else False)(self.handle_amazon_url)
-    
-    def extract_asin_from_url(self, url: str) -> Optional[str]:
-        """Extrae ASIN de URL de Amazon"""
-        patterns = [
-            r'/dp/([A-Z0-9]{10})',
-            r'/gp/product/([A-Z0-9]{10})',
-            r'amazon\.es/.*?/([A-Z0-9]{10})',
-            r'/product/([A-Z0-9]{10})'
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        return None
-    
-    def is_amazon_url(self, text: str) -> bool:
-        """Verifica si el texto contiene URL de Amazon España"""
-        if not text:
-            return False
-        return 'amazon.es' in text.lower() and self.extract_asin_from_url(text) is not None
-
-async def handle_target_price(self, message: types.Message, state: FSMContext):
-        """Maneja el precio objetivo ingresado por el usuario"""
-        try:
-            # Obtener datos del estado
-            data = await state.get_data()
-            product_url = data.get('product_url')
-            
-            if not product_url:
-                await message.answer("❌ Error: URL del producto no encontrada. Inicia de nuevo con /track")
-                await state.clear()
-                return
-            
-            # Validar y convertir precio
-            try:
-                target_price = float(message.text.replace('$', '').replace(',', ''))
-                if target_price <= 0:
-                    raise ValueError("El precio debe ser mayor a 0")
-            except ValueError:
-                await message.answer(
-                    "❌ **Precio inválido**\n\n"
-                    "Por favor ingresa un número válido (ejemplo: 99.99 o $99.99)"
-                )
-                return
-            
-            # Extraer ASIN del URL
-            asin = self.extract_asin(product_url)
-            if not asin:
-                await message.answer("❌ No se pudo extraer el ASIN del producto. Verifica la URL.")
-                await state.clear()
-                return
-            
-            # Obtener información del producto
-            await message.answer("🔍 **Obteniendo información del producto...**")
-            
-            try:
-                product_info = await self.amazon_api.get_product_info(asin)
-                if not product_info:
-                    await message.answer("❌ No se pudo obtener información del producto")
-                    await state.clear()
-                    return
-                
-                current_price = product_info.get('current_price', 0)
-                title = product_info.get('title', 'Producto desconocido')
-                image_url = product_info.get('image_url')
-                
-                # Guardar en base de datos
-                user_id = message.from_user.id
-                tracking_id = await self.db.add_tracking(
-                    user_id=user_id,
-                    asin=asin,
-                    product_url=product_url,
-                    current_price=current_price,
-                    target_price=target_price,
-                    title=title[:200],  # Limitar título
-                    image_url=image_url
-                )
-                
-                # Crear respuesta
-                status = "🔥 **¡PRECIO OBJETIVO ALCANZADO!**" if current_price <= target_price else "📊 **Seguimiento Activo**"
-                price_diff = current_price - target_price
-                diff_text = f"(-${abs(price_diff):.2f})" if price_diff < 0 else f"(+${price_diff:.2f})"
-                
-                response = f"""
-{status}
-
-🏷️ **Producto:** {title[:80]}{'...' if len(title) > 80 else ''}
-
-💰 **Precios:**
-• Actual: ${current_price:.2f}
-• Objetivo: ${target_price:.2f}
-• Diferencia: {diff_text}
-
-🔔 **Estado:** {'¡Compra ahora!' if current_price <= target_price else 'Te notificaré cuando baje'}
-
-📊 **ID Seguimiento:** `{tracking_id}`
-"""
-                
-                # Crear teclado
-                keyboard = InlineKeyboardBuilder()
-                keyboard.add(InlineKeyboardButton(
-                    text="📈 Ver Histórico",
-                    callback_data=f"history_{tracking_id}"
-                ))
-                keyboard.add(InlineKeyboardButton(
-                    text="🛒 Ver Producto",
-                    url=product_url
-                ))
-                keyboard.add(InlineKeyboardButton(
-                    text="❌ Eliminar Seguimiento",
-                    callback_data=f"delete_{tracking_id}"
-                ))
-                keyboard.adjust(1)
-                
-                await message.answer(
-                    response,
-                    reply_markup=keyboard.as_markup(),
-                    parse_mode="Markdown"
-                )
-                
-                # Log del tracking
-                logger.info(f"Nuevo tracking creado: User {user_id}, ASIN {asin}, Target ${target_price}")
-                
-            except Exception as e:
-                logger.error(f"Error obteniendo producto: {e}")
-                await message.answer(
-                    "❌ **Error al procesar el producto**\n\n"
-                    "Puede ser que:\n"
-                    "• La URL no sea válida\n"
-                    "• El producto no esté disponible\n"
-                    "• Problemas con Amazon API\n\n"
-                    "Inténtalo de nuevo con /track"
-                )
-            
-            # Limpiar estado
-            await state.clear()
-            
-        except Exception as e:
-            logger.error(f"Error en handle_target_price: {e}")
-            await message.answer("❌ Error interno. Inténtalo de nuevo con /track")
-            await state.clear()
-    
-    async def create_main_menu(self) -> InlineKeyboardMarkup:
-        """Crea menú principal"""
-        keyboard = InlineKeyboardBuilder()
-        
-        keyboard.row(InlineKeyboardButton(
-            text="🔍 Buscar Producto",
-            callback_data="menu:search"
-        ))
-        
-        keyboard.row(InlineKeyboardButton(
-            text="📋 Mis Productos",
-            callback_data="menu:my_products"
-        ))
-        
-        keyboard.row(
-            InlineKeyboardButton(
-                text="📊 Estadísticas",
-                callback_data="menu:stats"
-            ),
-            InlineKeyboardButton(
-                text="⚙️ Configuración",
-                callback_data="menu:settings"
-            )
-        )
-        
-        keyboard.row(InlineKeyboardButton(
-            text="ℹ️ Ayuda",
-            callback_data="menu:help"
-        ))
-        
-        return keyboard.as_markup()
-    
-    # COMANDOS PRINCIPALES
-    
-    async def cmd_start(self, message: types.Message):
-        """Comando /start"""
-        user = message.from_user
-        
-        # Registrar usuario en DB
-        await self.db.add_user(user.id, user.username, user.first_name)
-        
-        welcome_message = f"""
-🎉 <b>¡Hola {user.first_name}!</b>
-
-🤖 Soy tu asistente personal para seguir precios en Amazon.es
-
-<b>¿Qué puedo hacer?</b>
-🔍 Seguir productos de Amazon automáticamente
-📉 Alertarte cuando bajan los precios
-🏆 Detectar precios mínimos históricos
-📊 Mostrarte gráficos de evolución
-💰 Ayudarte a ahorrar dinero
-
-<b>Para empezar:</b>
-• Envíame cualquier enlace de Amazon.es
-• Usa el menú de abajo para navegar
-• Escribe /help para ver todos los comandos
-
-¡Comencemos a ahorrar! 💪
-        """
-        
-        await message.answer(
-            welcome_message,
-            reply_markup=await self.create_main_menu(),
-            parse_mode="HTML"
-        )
-    
-    async def cmd_help(self, message: types.Message):
-        """Comando /help"""
-        help_text = """
-<b>🤖 COMANDOS DISPONIBLES</b>
-
-<b>📋 Gestión de Productos:</b>
-/seguir - Seguir un nuevo producto
-/lista - Ver productos que sigues
-/buscar - Buscar productos en Amazon
-
-<b>⚙️ Configuración:</b>
-/config - Configurar notificaciones
-/horario - Cambiar horario de alertas
-
-<b>📊 Información:</b>
-/stats - Ver tus estadísticas
-/historial - Ver historial de un producto
-
-<b>🚀 Uso Rápido:</b>
-• Simplemente envía un enlace de Amazon.es
-• Te mostraré el precio actual e historial
-• Podrás seguir el producto con un botón
-
-<b>🔔 Tipos de Alertas:</b>
-🏆 Precio mínimo histórico
-📉 Bajadas de precio significativas
-🎯 Precio objetivo alcanzado
-📦 Cambios de disponibilidad
-
-<b>💡 Consejos:</b>
-• Sigue productos caros para mejores descuentos
-• Configura precios objetivo realistas
-• Activa notificaciones para no perder ofertas
-
-¿Necesitas ayuda específica? Escríbeme y te ayudo 😊
-        """
-        
-        await message.answer(help_text, parse_mode="HTML")
-    
-    async def cmd_follow_product(self, message: types.Message, state: FSMContext):
-        """Comando /seguir - Inicia proceso de seguimiento"""
-        await state.set_state(ProductStates.waiting_for_url)
-        
-        await message.answer(
-            "🔗 <b>Envíame el enlace del producto de Amazon.es que quieres seguir:</b>\n\n"
-            "Puedes copiar el enlace desde:\n"
-            "• La app de Amazon\n"
-            "• El navegador web\n"
-            "• Un mensaje compartido\n\n"
-            "<i>Cancelar: /cancel</i>",
-            parse_mode="HTML"
-        )
-    
-    async def cmd_my_products(self, message: types.Message):
-        """Comando /lista - Muestra productos seguidos"""
-        user_id = message.from_user.id
-        products = await self.db.get_user_products(user_id)
-        
-        if not products:
-            keyboard = InlineKeyboardBuilder()
-            keyboard.row(InlineKeyboardButton(
-                text="🔍 Buscar Producto",
-                callback_data="menu:search"
-            ))
-            
-            await message.answer(
-                "📭 <b>No estás siguiendo ningún producto aún</b>\n\n"
-                "Para empezar:\n"
-                "• Envíame un enlace de Amazon.es\n"
-                "• Usa /seguir para añadir productos\n"
-                "• Presiona el botón de abajo para buscar",
-                reply_markup=keyboard.as_markup(),
-                parse_mode="HTML"
-            )
-            return
-        
-        message_text = f"📋 <b>Tus productos seguidos ({len(products)}):</b>\n\n"
-        
-        for i, product in enumerate(products[:10], 1):  # Mostrar máximo 10
-            price = product['current_price']
-            title = product['title'][:40] + "..." if len(product['title']) > 40 else product['title']
-            
-            # Obtener precio mínimo
-            min_price = await self.db.get_min_price(product['id'])
-            price_indicator = ""
-            
-            if min_price and price and abs(price - min_price) < 0.01:
-                price_indicator = " 🏆"
-            elif product['target_price'] and price and price <= product['target_price']:
-                price_indicator = " 🎯"
-            
-            message_text += f"{i}. <b>{title}</b>\n"
-            message_text += f"   💰 {price:.2f}€{price_indicator}\n"
-            if product['target_price']:
-                message_text += f"   🎯 Objetivo: {product['target_price']:.2f}€\n"
-            message_text += "\n"
-        
-        if len(products) > 10:
-            message_text += f"... y {len(products) - 10} productos más\n\n"
-        
-        # Crear botones para navegación
-        keyboard = InlineKeyboardBuilder()
-        
-        keyboard.row(
-            InlineKeyboardButton(
-                text="📊 Ver Detalles",
-                callback_data="menu:product_details"
-            ),
-            InlineKeyboardButton(
-                text="🔍 Añadir Producto",
-                callback_data="menu:search"
-            )
-        )
-        
-        await message.answer(
-            message_text,
-            reply_markup=keyboard.as_markup(),
-            parse_mode="HTML"
-        )
-    
-    async def cmd_settings(self, message: types.Message):
-        """Comando /config - Configuración de usuario"""
-        keyboard = InlineKeyboardBuilder()
-        
-        keyboard.row(InlineKeyboardButton(
-            text="🔔 Notificaciones",
-            callback_data="settings:notifications"
-        ))
-        
-        keyboard.row(InlineKeyboardButton(
-            text="⏰ Horario de Alertas",
-            callback_data="settings:schedule"
-        ))
-        
-        keyboard.row(InlineKeyboardButton(
-            text="💰 Precio Mínimo",
-            callback_data="settings:min_price"
-        ))
-        
-        await message.answer(
-            "⚙️ <b>Configuración</b>\n\n"
-            "Personaliza cómo quieres recibir las alertas:",
-            reply_markup=keyboard.as_markup(),
-            parse_mode="HTML"
-        )
-    
-    async def cmd_stats(self, message: types.Message):
-        """Comando /stats - Estadísticas del usuario"""
-        user_id = message.from_user.id
-        
-        # Obtener estadísticas básicas
-        products = await self.db.get_user_products(user_id)
-        
-        async with self.db.pool.acquire() as conn:
-            # Clics totales
-            total_clicks = await conn.fetchval(
-                "SELECT COUNT(*) FROM analytics WHERE user_id = $1 AND action_type LIKE 'click%'",
-                user_id
-            ) or 0
-            
-            # Alertas recibidas
-            total_alerts = await conn.fetchval(
-                "SELECT COUNT(*) FROM analytics WHERE user_id = $1 AND action_type LIKE 'alert%'",
-                user_id
-            ) or 0
-            
-            # Registro del usuario
-            user_info = await conn.fetchrow(
-                "SELECT created_at, last_active FROM users WHERE user_id = $1",
-                user_id
-            )
-        
-        # Calcular ahorro estimado
-        total_savings = 0
-        for product in products:
-            min_price = await self.db.get_min_price(product['id'])
-            if min_price and product['current_price']:
-                # Estimar ahorro si compró al mínimo vs precio promedio
-                price_history = await self.db.get_price_history(product['id'], 30)
-                if price_history:
-                    avg_price = sum(p['price'] for p in price_history) / len(price_history)
-                    potential_saving = avg_price - min_price
-                    if potential_saving > 0:
-                        total_savings += potential_saving
-        
-        days_using = (datetime.now() - user_info['created_at']).days if user_info else 0
-        
-        stats_message = f"""
-📊 <b>TUS ESTADÍSTICAS</b>
-
-📱 <b>Productos seguidos:</b> {len(products)}
-🔔 <b>Alertas recibidas:</b> {total_alerts}
-👆 <b>Enlaces visitados:</b> {total_clicks}
-💰 <b>Ahorro estimado:</b> {total_savings:.2f}€
-
-📅 <b>Miembro desde:</b> {user_info['created_at'].strftime('%d/%m/%Y') if user_info else 'Hoy'}
-⏱️ <b>Días usando el bot:</b> {days_using}
-
-<b>🏆 PRODUCTOS CON MEJOR RENDIMIENTO:</b>
-        """
-        
-        # Añadir top productos por alertas
-        for product in products[:3]:
-            min_price = await self.db.get_min_price(product['id'])
-            current = product['current_price']
-            if min_price and current:
-                savings = current - min_price
-                if savings > 0:
-                    title = product['title'][:30] + "..."
-                    stats_message += f"\n💎 {title}\n   Ahorro máximo: {savings:.2f}€"
-        
-        await message.answer(stats_message, parse_mode="HTML")
-    
-    # HANDLERS DE MENSAJES
-    
-    async def handle_product_url(self, message: types.Message, state: FSMContext):
-        """Maneja URL de producto en estado de espera"""
-        if not message.text or not self.is_amazon_url(message.text):
-            await message.answer(
-                "❌ <b>URL no válida</b>\n\n"
-                "Por favor, envía un enlace válido de Amazon.es\n"
-                "Ejemplo: https://amazon.es/dp/B08N5WRWNW\n\n"
-                "<i>Cancelar: /cancel</i>",
-                parse_mode="HTML"
-            )
-            return
-        
-        await state.clear()
-        await self.process_amazon_url(message, message.text)
-    
-    async def handle_amazon_url(self, message: types.Message):
-        """Maneja URLs de Amazon enviadas directamente"""
-        await self.process_amazon_url(message, message.text)
-    
-    async def process_amazon_url(self, message: types.Message, url: str):
-        """Procesa URL de Amazon y muestra información del producto"""
-        asin = self.extract_asin_from_url(url)
-        
-        if not asin:
-            await message.answer(
-                "❌ No pude extraer el código del producto de esa URL.\n"
-                "Asegúrate de que sea un enlace válido de Amazon.es"
-            )
-            return
-        
-        # Mostrar mensaje de carga
-        loading_msg = await message.answer("🔍 <b>Buscando producto...</b>", parse_mode="HTML")
-        
-        try:
-            # Obtener información del producto
-            product_data = await self.amazon.get_product_info(asin)
-            
-            if not product_data:
-                await loading_msg.edit_text(
-                    "❌ <b>No pude obtener información del producto</b>\n\n"
-                    "Posibles causas:\n"
-                    "• El producto no está disponible\n"
-                    "• URL incorrecta\n"
-                    "• Error temporal de Amazon\n\n"
-                    "Intenta de nuevo en unos minutos.",
-                    parse_mode="HTML"
-                )
-                return
-            
-            # Guardar/actualizar producto en DB
-            product_id = await self.db.add_or_update_product(product_data)
-            
-            # Obtener historial de precios si existe
-            price_history = await self.db.get_price_history(product_id, 30)
-            min_price = await self.db.get_min_price(product_id)
-            
-            # Verificar si ya lo sigue el usuario
-            user_products = await self.db.get_user_products(message.from_user.id)
-            already_following = any(p['id'] == product_id for p in user_products)
-            
-            # Crear mensaje del producto
-            await self.send_product_info(
-                message.chat.id,
-                product_data,
-                product_id,
-                price_history,
-                min_price,
-                already_following,
-                loading_msg.message_id
-            )
-            
-        except Exception as e:
-            logger.error(f"Error procesando URL {url}: {e}")
-            await loading_msg.edit_text(
-                "❌ <b>Error procesando el producto</b>\n\n"
-                "Inténtalo de nuevo en unos minutos.",
-                parse_mode="HTML"
-            )
-    
-    async def send_product_info(self, chat_id: int, product: Dict, product_id: int,
-                               price_history: List, min_price: float, already_following: bool,
-                               edit_message_id: int = None):
-        """Envía información completa del producto"""
-        
-        # Preparar mensaje
-        title = product['title']
-        price = product['price']
-        
-        message_text = f"📱 <b>{title}</b>\n\n"
-        
-        if price:
-            message_text += f"💰 <b>Precio actual: {price:.2f}€</b>\n"
-            
-            # Indicador de precio mínimo
-            if min_price and abs(price - min_price) < 0.01:
-                message_text += "🏆 <b>¡PRECIO MÍNIMO HISTÓRICO!</b>\n"
-            elif min_price:
-                diff = price - min_price
-                message_text += f"📊 Mínimo histórico: {min_price:.2f}€ (+{diff:.2f}€)\n"
-        else:
-            message_text += "❌ <b>Precio no disponible</b>\n"
-        
-        # Información adicional
-        if product['availability']:
-            if 'Available' in product['availability'] or 'InStock' in product['availability']:
-                message_text += "✅ Disponible\n"
-            else:
-                message_text += f"⚠️ {product['availability']}\n"
-        
-        if product['rating'] and product['reviews_count']:
-            stars = "⭐" * int(product['rating'])
-            message_text += f"{stars} {product['rating']:.1f}/5 ({product['reviews_count']:,} reseñas)\n"
-        
-        # Historial de precios
-        if price_history:
-            message_text += f"\n📈 <b>Historial ({len(price_history)} registros):</b>\n"
-            
-            if len(price_history) >= 2:
-                trend = "📈" if price_history[-1]['price'] > price_history[-2]['price'] else "📉"
-                message_text += f"{trend} Tendencia reciente\n"
-        else:
-            message_text += "\n📊 <i>Primer registro de precio</i>\n"
-        
-        # Crear botones
-        keyboard = InlineKeyboardBuilder()
-        
-        # Botón principal
-        if min_price and price and abs(price - min_price) < 0.01:
-            keyboard.row(InlineKeyboardButton(
-                text="🏆 COMPRAR AL MÍNIMO HISTÓRICO",
-                url=product['affiliate_url']
-            ))
-        else:
-            keyboard.row(InlineKeyboardButton(
-                text="🛒 COMPRAR AHORA",
-                url=product['affiliate_url']
-            ))
-        
-        # Botones secundarios
-        if already_following:
-            keyboard.row(InlineKeyboardButton(
-                text="✅ Ya lo sigues",
-                callback_data="noop"
-            ))
-        else:
-            keyboard.row(InlineKeyboardButton(
-                text="🔔 SEGUIR PRODUCTO",
-                callback_data=f"follow_confirm:{product_id}"
-            ))
-        
-        keyboard.row(
-            InlineKeyboardButton(
-                text="📊 Ver Gráfico",
-                callback_data=f"history:{product_id}"
-            ),
-            InlineKeyboardButton(
-                text="🔍 Buscar Similar",
-                callback_data=f"similar:{product_id}"
-            )
-        )
-        
-        # Enviar o editar mensaje
-        try:
-            if edit_message_id:
-                await self.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=edit_message_id,
-                    text=message_text,
-                    reply_markup=keyboard.as_markup(),
-                    parse_mode="HTML"
-                )
-                
-                # Enviar imagen por separado si está disponible
-                if product['image_url']:
-                    await self.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=product['image_url'],
-                        reply_markup=keyboard.as_markup()
-                    )
-            else:
-                if product['image_url']:
-                    await self.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=product['image_url'],
-                        caption=message_text,
-                        reply_markup=keyboard.as_markup(),
-                        parse_mode="HTML"
-                    )
-                else:
-                    await self.bot.send_message(
-                        chat_id=chat_id,
-                        text=message_text,
-                        reply_markup=keyboard.as_markup(),
-                        parse_mode="HTML"
-                    )
-            
-            # Registrar analytics
-            await self.db.log_analytics(
-                chat_id, product_id, "view_product", 
-                {'source': 'url_share', 'has_image': bool(product['image_url'])}
-            )
-            
-        except Exception as e:
-            logger.error(f"Error enviando info de producto: {e}")
-    
-    # CALLBACK HANDLERS
-    
-    async def cb_confirm_follow(self, callback: CallbackQuery):
-        """Confirma seguimiento de producto"""
-        try:
-            product_id = int(callback.data.split(":")[1])
-            user_id = callback.from_user.id
-            
-            # Verificar que el producto existe
-            async with self.db.pool.acquire() as conn:
-                product = await conn.fetchrow(
-                    "SELECT * FROM products WHERE id = $1", product_id
-                )
-            
-            if not product:
-                await callback.answer("❌ Producto no encontrado")
-                return
-            
-            # Añadir seguimiento
-            success = await self.db.add_user_product(user_id, product_id)
-            
-            if success:
-                await callback.answer("✅ ¡Producto añadido a tu lista!")
-                
-                # Actualizar botón
-                keyboard = InlineKeyboardBuilder()
-                keyboard.row(InlineKeyboardButton(
-                    text="🛒 COMPRAR AHORA",
-                    url=product['affiliate_url']
-                ))
-                keyboard.row(InlineKeyboardButton(
-                    text="✅ Siguiendo producto",
-                    callback_data="noop"
-                ))
-                keyboard.row(
-                    InlineKeyboardButton(
-                        text="📊 Ver Gráfico",
-                        callback_data=f"history:{product_id}"
-                    ),
-                    InlineKeyboardButton(
-                        text="🗑️ Dejar de Seguir",
-                        callback_data=f"unfollow:{product_id}"
-                    )
-                )
-                
-                try:
-                    await callback.message.edit_reply_markup(
-                        reply_markup=keyboard.as_markup()
-                    )
-                except:
-                    pass  # Ignorar si no se puede editar
-                
-                # Registrar analytics
-                await self.db.log_analytics(user_id, product_id, "follow_product")
-                
-            else:
-                await callback.answer("❌ Error al seguir el producto")
-                
-        except Exception as e:
-            logger.error(f"Error en follow confirm: {e}")
-            await callback.answer("❌ Error interno")
-    
-    async def cb_unfollow_product(self, callback: CallbackQuery):
-        """Deja de seguir producto"""
-        try:
-            product_id = int(callback.data.split(":")[1])
-            user_id = callback.from_user.id
-            
-            success = await self.db.remove_user_product(user_id, product_id)
-            
-            if success:
-                await callback.answer("✅ Producto eliminado de tu lista")
-                
-                # Registrar analytics
-                await self.db.log_analytics(user_id, product_id, "unfollow_product")
-                
-                # Actualizar mensaje si es posible
-                try:
-                    await callback.message.delete()
-                except:
-                    pass
-            else:
-                await callback.answer("❌ Error al eliminar producto")
-                
-        except Exception as e:
-            logger.error(f"Error en unfollow: {e}")
-            await callback.answer("❌ Error interno")
-    
-    async def cb_show_history(self, callback: CallbackQuery):
-        """Muestra historial de precios con gráfico"""
-        try:
-            product_id = int(callback.data.split(":")[1])
-            
-            # Obtener historial de precios
-            price_history = await self.db.get_price_history(product_id, 30)
-            
-            if not price_history or len(price_history) < 2:
-                await callback.answer("📊 Historial insuficiente para generar gráfico")
-                return
-            
-            # Generar gráfico
-            chart_buffer = await self.generate_price_chart(product_id, price_history)
-            
-            if chart_buffer:
-                # Obtener info del producto
-                async with self.db.pool.acquire() as conn:
-                    product = await conn.fetchrow(
-                        "SELECT title, current_price FROM products WHERE id = $1", 
-                        product_id
-                    )
-                
-                min_price = min(p['price'] for p in price_history)
-                max_price = max(p['price'] for p in price_history)
-                avg_price = sum(p['price'] for p in price_history) / len(price_history)
-                
-                caption = f"""
-📊 <b>Historial de {product['title'][:40]}...</b>
-
-📈 <b>Estadísticas (30 días):</b>
-💰 Precio actual: {product['current_price']:.2f}€
-🔻 Mínimo: {min_price:.2f}€
-🔺 Máximo: {max_price:.2f}€
-📊 Promedio: {avg_price:.2f}€
-
-📅 <b>Registros:</b> {len(price_history)} puntos de datos
-                """
-                
-                await callback.message.answer_photo(
-                    photo=chart_buffer,
-                    caption=caption,
-                    parse_mode="HTML"
-                )
-                
-                await callback.answer()
-                
-                # Registrar analytics
-                await self.db.log_analytics(
-                    callback.from_user.id, product_id, "view_chart"
-                )
-            else:
-                await callback.answer("❌ Error generando gráfico")
-                
-        except Exception as e:
-            logger.error(f"Error mostrando historial: {e}")
-            await callback.answer("❌ Error interno")
-    
-    async def generate_price_chart(self, product_id: int, price_history: List[Dict]) -> Optional[io.BytesIO]:
-        """Genera gráfico de evolución de precios"""
-        try:
-            import matplotlib
-            matplotlib.use('Agg')  # Backend para servidores sin GUI
-            
-            dates = [p['recorded_at'] for p in price_history]
-            prices = [float(p['price']) for p in price_history]
-            
-            # Configurar matplotlib en español
-            plt.style.use('seaborn-v0_8')
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            # Gráfico principal
-            ax.plot(dates, prices, linewidth=2.5, color='#FF9500', marker='o', markersize=4)
-            ax.fill_between(dates, prices, alpha=0.3, color='#FF9500')
-            
-            # Líneas de referencia
-            min_price = min(prices)
-            max_price = max(prices)
-            avg_price = sum(prices) / len(prices)
-            
-            ax.axhline(y=min_price, color='green', linestyle='--', alpha=0.7, label=f'Mínimo: {min_price:.2f}€')
-            ax.axhline(y=avg_price, color='blue', linestyle='--', alpha=0.7, label=f'Promedio: {avg_price:.2f}€')
-            
-            # Styling
-            ax.set_title('Evolución del Precio - Últimos 30 días', fontsize=16, fontweight='bold')
-            ax.set_xlabel('Fecha', fontsize=12)
-            ax.set_ylabel('Precio (€)', fontsize=12)
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc='upper right')
-            
-            # Formatear fechas en eje X
-            fig.autofmt_xdate()
-            
-            # Ajustar layout
-            plt.tight_layout()
-            
-            # Guardar en buffer
-            buffer = io.BytesIO()
-            plt.savefig(buffer, format='PNG', dpi=150, bbox_inches='tight')
-            buffer.seek(0)
-            plt.close(fig)
-            
-            return buffer
-            
-        except Exception as e:
-            logger.error(f"Error generando gráfico: {e}")
-            return None
-    
-    async def cb_buy_product(self, callback: CallbackQuery):
-        """Registra click en enlace de compra"""
-        try:
-            product_id = int(callback.data.split(":")[1])
-            user_id = callback.from_user.id
-            
-            # Registrar click
-            await self.db.log_analytics(user_id, product_id, "click_buy")
-            
-            await callback.answer("🛒 Redirigiendo a Amazon...")
-            
-        except Exception as e:
-            logger.error(f"Error en buy click: {e}")
-            await callback.answer()
-    
-    async def cb_menu_navigation(self, callback: CallbackQuery):
-        """Maneja navegación del menú"""
-        try:
-            action = callback.data.split(":")[1]
-            
-            if action == "search":
-                await callback.message.edit_text(
-                    "🔍 <b>Buscar Producto</b>\n\n"
-                    "Envíame un enlace de Amazon.es para empezar a seguir el precio.\n\n"
-                    "También puedes usar:\n"
-                    "• /seguir - Para buscar paso a paso\n"
-                    "• Pegar enlace directamente en el chat",
-                    parse_mode="HTML",
-                    reply_markup=await self.create_main_menu()
-                )
-            
-            elif action == "my_products":
-                # Redirigir al comando lista
-                await self.cmd_my_products(callback.message)
-            
-            elif action == "stats":
-                await self.cmd_stats(callback.message)
-            
-            elif action == "settings":
-                await self.cmd_settings(callback.message)
-            
-            elif action == "help":
-                await self.cmd_help(callback.message)
-            
-            await callback.answer()
-            
-        except Exception as e:
-            logger.error(f"Error en navegación de menú: {e}")
-            await callback.answer("❌ Error interno")
-    
-    async def start_bot(self):
-        """Inicia el bot y todos los servicios"""
-        try:
-            # Inicializar base de datos
-            await self.db.init_db()
-            logger.info("Base de datos inicializada")
-            
-            # Inicializar monitor de precios
-            self.monitor = PriceMonitor(self.db, self.amazon, self.bot)
-            self.monitor.start_monitoring()
-            logger.info("Monitor de precios iniciado")
-            
-            # Configurar webhook o polling
-            await self.dp.start_polling(self.bot, drop_pending_updates=True)
-            
-        except Exception as e:
-            logger.error(f"Error iniciando bot: {e}")
-            raise
-    
-    async def stop_bot(self):
-        """Para el bot y limpia recursos"""
-        try:
-            if self.monitor and self.monitor.scheduler.running:
-                self.monitor.scheduler.shutdown()
-            
-            if self.db.pool:
-                await self.db.pool.close()
-            
-            await self.bot.session.close()
-            logger.info("Bot detenido correctamente")
-            
-        except Exception as e:
-            logger.error(f"Error deteniendo bot: {e}")
-
-# Funciones auxiliares para despliegue en Railway
-
-async def create_app():
-    """Crea la aplicación del bot"""
-    bot_instance = TelegramBot()
-    return bot_instance
-
-def setup_logging():
-    """Configura el sistema de logging"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('bot.log') if os.path.exists('/app') else logging.StreamHandler()
-        ]
-    )
-
-# Script principal
-async def main():
-    """Función principal del bot"""
-    setup_logging()
-    
-    bot = await create_app()
-    
-    try:
-        logger.info("🚀 Iniciando VSO Amazon Bot...")
-        await bot.start_bot()
-    except KeyboardInterrupt:
-        logger.info("⏹️ Bot detenido por usuario")
-    except Exception as e:
-        logger.error(f"💥 Error crítico: {e}")
-    finally:
-        await bot.stop_bot()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+class

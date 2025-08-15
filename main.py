@@ -772,6 +772,127 @@ class TelegramBot:
         if not text:
             return False
         return 'amazon.es' in text.lower() and self.extract_asin_from_url(text) is not None
+
+async def handle_target_price(self, message: types.Message, state: FSMContext):
+        """Maneja el precio objetivo ingresado por el usuario"""
+        try:
+            # Obtener datos del estado
+            data = await state.get_data()
+            product_url = data.get('product_url')
+            
+            if not product_url:
+                await message.answer("❌ Error: URL del producto no encontrada. Inicia de nuevo con /track")
+                await state.clear()
+                return
+            
+            # Validar y convertir precio
+            try:
+                target_price = float(message.text.replace('$', '').replace(',', ''))
+                if target_price <= 0:
+                    raise ValueError("El precio debe ser mayor a 0")
+            except ValueError:
+                await message.answer(
+                    "❌ **Precio inválido**\n\n"
+                    "Por favor ingresa un número válido (ejemplo: 99.99 o $99.99)"
+                )
+                return
+            
+            # Extraer ASIN del URL
+            asin = self.extract_asin(product_url)
+            if not asin:
+                await message.answer("❌ No se pudo extraer el ASIN del producto. Verifica la URL.")
+                await state.clear()
+                return
+            
+            # Obtener información del producto
+            await message.answer("🔍 **Obteniendo información del producto...**")
+            
+            try:
+                product_info = await self.amazon_api.get_product_info(asin)
+                if not product_info:
+                    await message.answer("❌ No se pudo obtener información del producto")
+                    await state.clear()
+                    return
+                
+                current_price = product_info.get('current_price', 0)
+                title = product_info.get('title', 'Producto desconocido')
+                image_url = product_info.get('image_url')
+                
+                # Guardar en base de datos
+                user_id = message.from_user.id
+                tracking_id = await self.db.add_tracking(
+                    user_id=user_id,
+                    asin=asin,
+                    product_url=product_url,
+                    current_price=current_price,
+                    target_price=target_price,
+                    title=title[:200],  # Limitar título
+                    image_url=image_url
+                )
+                
+                # Crear respuesta
+                status = "🔥 **¡PRECIO OBJETIVO ALCANZADO!**" if current_price <= target_price else "📊 **Seguimiento Activo**"
+                price_diff = current_price - target_price
+                diff_text = f"(-${abs(price_diff):.2f})" if price_diff < 0 else f"(+${price_diff:.2f})"
+                
+                response = f"""
+{status}
+
+🏷️ **Producto:** {title[:80]}{'...' if len(title) > 80 else ''}
+
+💰 **Precios:**
+• Actual: ${current_price:.2f}
+• Objetivo: ${target_price:.2f}
+• Diferencia: {diff_text}
+
+🔔 **Estado:** {'¡Compra ahora!' if current_price <= target_price else 'Te notificaré cuando baje'}
+
+📊 **ID Seguimiento:** `{tracking_id}`
+"""
+                
+                # Crear teclado
+                keyboard = InlineKeyboardBuilder()
+                keyboard.add(InlineKeyboardButton(
+                    text="📈 Ver Histórico",
+                    callback_data=f"history_{tracking_id}"
+                ))
+                keyboard.add(InlineKeyboardButton(
+                    text="🛒 Ver Producto",
+                    url=product_url
+                ))
+                keyboard.add(InlineKeyboardButton(
+                    text="❌ Eliminar Seguimiento",
+                    callback_data=f"delete_{tracking_id}"
+                ))
+                keyboard.adjust(1)
+                
+                await message.answer(
+                    response,
+                    reply_markup=keyboard.as_markup(),
+                    parse_mode="Markdown"
+                )
+                
+                # Log del tracking
+                logger.info(f"Nuevo tracking creado: User {user_id}, ASIN {asin}, Target ${target_price}")
+                
+            except Exception as e:
+                logger.error(f"Error obteniendo producto: {e}")
+                await message.answer(
+                    "❌ **Error al procesar el producto**\n\n"
+                    "Puede ser que:\n"
+                    "• La URL no sea válida\n"
+                    "• El producto no esté disponible\n"
+                    "• Problemas con Amazon API\n\n"
+                    "Inténtalo de nuevo con /track"
+                )
+            
+            # Limpiar estado
+            await state.clear()
+            
+        except Exception as e:
+            logger.error(f"Error en handle_target_price: {e}")
+            await message.answer("❌ Error interno. Inténtalo de nuevo con /track")
+            await state.clear()
     
     async def create_main_menu(self) -> InlineKeyboardMarkup:
         """Crea menú principal"""
